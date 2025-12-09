@@ -1,194 +1,225 @@
+import csv
+import re
+import time
+from pathlib import Path
+from typing import List, Dict, Set
+
 import requests
 from bs4 import BeautifulSoup
-import csv
-from datetime import datetime
-import time
+import feedparser
 
-# Define the keywords to search for
-keywords = [
-    # Mental health related
-    'mental health', 'mental', 'mentally', 'behavioural', 'emotional',
-    'psychiatry', 'psychiatric', 'psychiatrist', 'psychology', 'psychological',
-    'psychologist', 'counselling', 'counseling', 'counsellor', 'counselor',
-    'therapy', 'therapist', 'therapeutic', 'psychotherapy', 'psychotherapeutic',
-    'psychotherapists', 'depression', 'depressed', 'suicide', 'suicidal',
-    'anxiety', 'anxious', 'stress', 'stressed', 'trauma', 'traumatised',
-    'traumatized', 'self-harm', 'stigma', 'resilience', 'discriminate',
-    'discrimination', 'discriminated',
-    # LGBT+ related
-    'lgbt', 'lgbtq', 'lgbtqia', 'lgbtq+', 'lgbtqia+', 'lesbian', 'gay',
-    'homosexual', 'homosexuality', 'bisexual', 'bisexuality', 'transgender',
-    'transwoman', 'transwomen', 'transman', 'transmen', 'trans', 'transsexual',
-    'transvestite', 'non-binary', 'nonbinary', 'queer', 'intersex', 'sogie',
-    'sogiesc', 'sex', 'sexual', 'sexuality', 'gender', 'masculine',
-    'masculinity', 'feminine', 'femininity'
+
+# ===================== CONFIGURATION =====================
+
+BASE_URL = "https://www.malaysiakini.com"
+RSS_URL = "https://www.malaysiakini.com/rss/en/news.rss"  # English news feed
+
+# Delay between HTTP requests (be polite!)
+REQUEST_DELAY = 1.0  # seconds
+TIMEOUT = 15
+MAX_RSS_ITEMS = None  # set to an int to limit, e.g. 500
+
+OUTPUT_DIR = Path("malaysiakini_corpus")
+OUTPUT_DIR.mkdir(exist_ok=True)
+
+CSV_PATH = OUTPUT_DIR / "malaysiakini_keyword_hits.csv"
+TEXT_DIR = OUTPUT_DIR / "articles"
+TEXT_DIR.mkdir(exist_ok=True)
+
+HEADERS = {
+    "User-Agent": "AcademicKeywordScraper/1.0 (contact: your-email@example.com)"
+}
+
+# --------- KEYWORDS (from Dawn’s table; can be edited) ---------
+
+MENTAL_HEALTH_KEYWORDS = [
+    "mental", "mentally", "behavioural", "behavioral",
+    "emotional",
+    "psychiatry", "psychiatric", "psychiatrist",
+    "psychology", "psychological", "psychologist",
+    "counselling", "counseling", "counsellor", "counselor",
+    "therapy", "therapist", "therapeutic",
+    "psychotherapy", "psychotherapeutic", "psychotherapists",
+    "depression", "depressed",
+    "suicide", "suicidal",
+    "anxiety", "anxious",
+    "stress", "stressed",
+    "trauma", "traumatised", "traumatized",
+    "self-harm",
+    "stigma",
+    "resilience",
+    "discriminate", "discrimination", "discriminated",
 ]
 
-def scrape_malaysiakini(keywords, max_pages=5):
-    """
-    Scrape Malaysiakini for articles containing specified keywords
-    """
-    base_url = "https://www.malaysiakini.com"
-    results = []
-    
-    print(f"Starting scrape of Malaysiakini...")
-    print(f"Searching for {len(keywords)} keywords")
-    print("-" * 60)
-    
-    # Try to get recent articles from the main page and sections
-    sections = ['news', 'columns', 'letters']
-    
-    for section in sections:
-        print(f"\nSearching in section: {section}")
+LGBT_KEYWORDS = [
+    "lgb", "lgbt", "lgbtq", "lgbtq+", "lgbtqia", "lgbtqia+",
+    "lesbian", "gay",
+    "homosexual", "homosexuality",
+    "bisexual", "bisexuality",
+    "transgender", "trans",
+    "transwoman", "transwomen",
+    "transman", "transmen",
+    "transsexual", "transvestite",
+    "non-binary", "nonbinary",
+    "queer", "intersex",
+    "sogie", "sogiesc",
+    "sex", "sexual", "sexuality",
+    "gender",
+    "masculine", "masculinity",
+    "feminine", "femininity",
+]
+
+ALL_KEYWORDS = sorted(set(
+    [kw.lower() for kw in MENTAL_HEALTH_KEYWORDS + LGBT_KEYWORDS]
+))
+
+# Compile regex patterns with word boundaries (case-insensitive)
+KEYWORD_PATTERNS: Dict[str, re.Pattern] = {
+    kw: re.compile(rf"\b{re.escape(kw)}\b", re.IGNORECASE) for kw in ALL_KEYWORDS
+}
+
+
+# ===================== CORE FUNCTIONS =====================
+
+def fetch_url(url: str) -> str | None:
+    """Fetch a URL with basic retries. Returns HTML text or None."""
+    for attempt in range(3):
         try:
-            url = f"{base_url}/{section}"
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            }
-            
-            response = requests.get(url, headers=headers, timeout=10)
-            response.raise_for_status()
-            
-            soup = BeautifulSoup(response.content, 'html.parser')
-            
-            # Find article links (this may need adjustment based on actual site structure)
-            articles = soup.find_all('a', href=True)
-            
-            article_count = 0
-            for article in articles:
-                link = article.get('href')
-                if not link or not link.startswith('/news/'):
-                    continue
-                
-                full_link = base_url + link if link.startswith('/') else link
-                title = article.get_text(strip=True)
-                
-                if not title or len(title) < 10:
-                    continue
-                
-                # Check if any keyword is in the title (case-insensitive)
-                title_lower = title.lower()
-                matching_keywords = [kw for kw in keywords if kw.lower() in title_lower]
-                
-                if matching_keywords:
-                    article_count += 1
-                    result = {
-                        'title': title,
-                        'url': full_link,
-                        'section': section,
-                        'matching_keywords': ', '.join(matching_keywords),
-                        'date_scraped': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                    }
-                    results.append(result)
-                    print(f"  ✓ Found: {title[:60]}...")
-                
-                # Be respectful with requests
-                time.sleep(0.5)
-            
-            print(f"  Found {article_count} matching articles in {section}")
-            
-        except Exception as e:
-            print(f"  Error scraping {section}: {e}")
-        
-        # Be respectful between sections
-        time.sleep(1)
-    
-    return results
+            resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+            if resp.status_code == 200:
+                return resp.text
+            elif resp.status_code == 404:
+                # Not found; no point retrying
+                return None
+            else:
+                print(f"[WARN] {url} -> HTTP {resp.status_code}")
+        except requests.RequestException as e:
+            print(f"[ERROR] Request failed ({url}): {e}")
+        # Backoff before retry
+        time.sleep(2 ** attempt)
+    return None
 
-def search_malaysiakini_api(keywords, max_results=50):
-    """
-    Alternative approach: Use site's search functionality if available
-    """
-    base_url = "https://www.malaysiakini.com"
-    results = []
-    
-    print("\nTrying search-based approach...")
-    
-    # Search for each major keyword category
-    search_terms = ['mental health', 'lgbt', 'transgender', 'depression', 'anxiety']
-    
-    for term in search_terms:
-        try:
-            # This is a generic approach - actual search URL may differ
-            search_url = f"{base_url}/search?query={term.replace(' ', '+')}"
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            }
-            
-            print(f"  Searching for: {term}")
-            response = requests.get(search_url, headers=headers, timeout=10)
-            
-            if response.status_code == 200:
-                soup = BeautifulSoup(response.content, 'html.parser')
-                # Extract search results (structure depends on site)
-                # This would need to be customized based on actual HTML structure
-                print(f"  Got response for {term}")
-            
-            time.sleep(2)  # Be respectful
-            
-        except Exception as e:
-            print(f"  Error searching for {term}: {e}")
-    
-    return results
 
-def save_to_csv(results, filename='malaysiakini_articles.csv'):
+def extract_plain_text(html: str) -> str:
     """
-    Save results to CSV file
+    Strip HTML and return a single normalised text string.
+    We intentionally keep everything (nav, footer etc.) because we only
+    care about whether the keyword appears anywhere on the page.
     """
-    if not results:
-        print("\nNo results to save.")
-        return
-    
-    with open(filename, 'w', newline='', encoding='utf-8') as f:
-        fieldnames = ['title', 'url', 'section', 'matching_keywords', 'date_scraped']
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        
-        writer.writeheader()
-        writer.writerows(results)
-    
-    print(f"\n✓ Results saved to {filename}")
+    soup = BeautifulSoup(html, "html.parser")
 
-def main():
-    print("=" * 60)
-    print("Malaysiakini News Scraper")
-    print("Keywords: Mental Health & LGBT+ related terms")
-    print("=" * 60)
-    
-    # Method 1: Scrape main sections
-    results = scrape_malaysiakini(keywords, max_pages=5)
-    
-    # Display summary
-    print("\n" + "=" * 60)
-    print(f"SUMMARY")
-    print("=" * 60)
-    print(f"Total articles found: {len(results)}")
-    
-    if results:
-        print("\nSample results:")
-        for i, result in enumerate(results[:5], 1):
-            print(f"\n{i}. {result['title']}")
-            print(f"   URL: {result['url']}")
-            print(f"   Keywords: {result['matching_keywords']}")
-        
-        # Save to CSV
-        save_to_csv(results)
-        
-        print(f"\n✓ All {len(results)} results saved to CSV")
+    # Remove scripts, styles, etc.
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+
+    text = soup.get_text(separator=" ", strip=True)
+    # Normalise whitespace
+    return re.sub(r"\s+", " ", text)
+
+
+def find_matching_keywords(text: str) -> List[str]:
+    """Return a sorted list of keywords found in the given text."""
+    matches: Set[str] = set()
+    for kw, pattern in KEYWORD_PATTERNS.items():
+        if pattern.search(text):
+            matches.add(kw)
+    return sorted(matches)
+
+
+def article_id_from_url(url: str) -> str:
+    """
+    Extract a reasonable file stem from the article URL.
+    Malaysiakini news URLs look like /news/762983
+    """
+    m = re.search(r"/news/(\d+)", url)
+    if m:
+        return m.group(1)
+    # fallback: slug from last path part
+    slug = url.rstrip("/").split("/")[-1]
+    slug = re.sub(r"[^\w\-]+", "_", slug)
+    return slug or "article"
+
+
+def process_rss_feed(rss_url: str = RSS_URL, max_items: int | None = MAX_RSS_ITEMS):
+    """
+    Parse the RSS feed, fetch each article, check for keyword matches,
+    and save any hits to CSV + individual text files.
+    """
+    print(f"[INFO] Fetching RSS feed: {rss_url}")
+    feed = feedparser.parse(rss_url)
+
+    rows = []
+    seen_urls: Set[str] = set()
+
+    for i, entry in enumerate(feed.entries):
+        if max_items is not None and i >= max_items:
+            break
+
+        url = entry.link
+        if not url.startswith("http"):
+            url = BASE_URL + url
+
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+
+        title = entry.title
+        published = getattr(entry, "published", "")
+        print(f"[INFO] [{i+1}/{len(feed.entries)}] Fetching article: {title} ({url})")
+
+        html = fetch_url(url)
+        if not html:
+            print(f"[WARN] Skipping (could not fetch): {url}")
+            time.sleep(REQUEST_DELAY)
+            continue
+
+        text = extract_plain_text(html)
+        matches = find_matching_keywords(text)
+
+        if matches:
+            print(f"  -> HIT: {len(matches)} keyword(s) found")
+            article_id = article_id_from_url(url)
+            text_path = TEXT_DIR / f"{article_id}.txt"
+            with text_path.open("w", encoding="utf-8") as f:
+                f.write(text)
+
+            rows.append({
+                "url": url,
+                "title": title,
+                "published": published,
+                "keywords": ";".join(matches),
+                "text_file": str(text_path),
+            })
+        else:
+            print("  -> no relevant keywords")
+
+        time.sleep(REQUEST_DELAY)
+
+    # Write CSV summary
+    if rows:
+        with CSV_PATH.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=["url", "title", "published", "keywords", "text_file"],
+            )
+            writer.writeheader()
+            writer.writerows(rows)
+
+        print(f"[INFO] Done. {len(rows)} matching articles saved to {CSV_PATH}")
     else:
-        print("\nNo matching articles found.")
-        print("\nNote: This script may need customization based on:")
-        print("1. Malaysiakini's actual HTML structure")
-        print("2. Whether they have anti-scraping measures")
-        print("3. Whether you need to handle pagination differently")
-    
-    print("\n" + "=" * 60)
-    print("IMPORTANT NOTES:")
-    print("=" * 60)
-    print("1. Always check the website's robots.txt and terms of service")
-    print("2. Be respectful with request rates (delays are included)")
-    print("3. You may need Malaysiakini subscription for full access")
-    print("4. Consider using their API if available")
-    print("5. This script may need HTML structure updates over time")
+        print("[INFO] No matches found in the RSS feed.")
+
+
+# ===================== ENTRY POINT =====================
 
 if __name__ == "__main__":
-    main()
+    """
+    Usage:
+        python scrape_malaysiakini_keywords.py
+
+    Adjust:
+      - RSS_URL if you want a different section/language
+      - keyword lists above
+      - MAX_RSS_ITEMS if you want to limit how many feed items you scan
+    """
+    process_rss_feed()
